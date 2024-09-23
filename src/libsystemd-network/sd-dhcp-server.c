@@ -1020,8 +1020,9 @@ static bool address_available(sd_dhcp_server *server, be32_t address) {
 int dhcp_server_handle_message(sd_dhcp_server *server, DHCPMessage *message, size_t length, const triple_timestamp *timestamp) {
         _cleanup_(dhcp_request_freep) DHCPRequest *req = NULL;
         _cleanup_free_ char *error_message = NULL;
-        sd_dhcp_server_lease *existing_lease, *static_lease;
+        sd_dhcp_server_lease *existing_lease_for_client_id, *static_lease, *existing_lease_for_address = NULL;
         int type, r;
+        bool ignore_existing_lease = true;
 
         assert(server);
         assert(message);
@@ -1047,7 +1048,8 @@ int dhcp_server_handle_message(sd_dhcp_server *server, DHCPMessage *message, siz
         if (r < 0)
                 return r;
 
-        existing_lease = hashmap_get(server->bound_leases_by_client_id, &req->client_id);
+        existing_lease_for_client_id = hashmap_get(server->bound_leases_by_client_id, &req->client_id);
+        log_dhcp_server(server, "looked up existing lease by client ID: %d", existing_lease_for_client_id != NULL);
         static_lease = dhcp_server_get_static_lease(server, req);
 
         switch (type) {
@@ -1063,17 +1065,19 @@ int dhcp_server_handle_message(sd_dhcp_server *server, DHCPMessage *message, siz
 
                 /* for now pick a random free address from the pool */
                 if (static_lease) {
-                        if (existing_lease != hashmap_get(server->bound_leases_by_address, UINT32_TO_PTR(static_lease->address)))
+                        if (!ignore_existing_lease && existing_lease_for_client_id != hashmap_get(server->bound_leases_by_address, UINT32_TO_PTR(static_lease->address))) {
                                 /* The address is already assigned to another host. Refusing. */
+                                log_dhcp_server(server, "Address is already assigned to another host");
                                 return 0;
+                        }
 
                         /* Found a matching static lease. */
                         address = static_lease->address;
 
-                } else if (existing_lease && address_is_in_pool(server, existing_lease->address))
+                } else if (existing_lease_for_client_id && address_is_in_pool(server, existing_lease_for_client_id->address))
 
                         /* If we previously assigned an address to the host, then reuse it. */
-                        address = existing_lease->address;
+                        address = existing_lease_for_client_id->address;
 
                 else {
                         struct siphash state;
@@ -1102,8 +1106,17 @@ int dhcp_server_handle_message(sd_dhcp_server *server, DHCPMessage *message, siz
                         /* no free addresses left */
                         return 0;
 
-                if (server->rapid_commit && req->rapid_commit)
+                if (server->rapid_commit && req->rapid_commit) {
+                        /* We can still have a colliding existing lease when we're told to ignore it above.
+                         * Before handing out an ACK, remove any conflicting lease. */
+                        existing_lease_for_address = hashmap_get(server->bound_leases_by_address, UINT32_TO_PTR(address));
+                        if (existing_lease_for_address != NULL && existing_lease_for_client_id != existing_lease_for_address) {
+                                log_dhcp_server(server, "Overriding conflicting lease for address 0x%x", be32toh(existing_lease_for_address->address));
+                                sd_dhcp_server_lease_unref(existing_lease_for_address);
+                        }
+
                         return server_ack_request(server, req, address);
+                }
 
                 r = server_send_offer_or_ack(server, req, address, DHCP_OFFER);
                 if (r < 0)
@@ -1173,15 +1186,31 @@ int dhcp_server_handle_message(sd_dhcp_server *server, DHCPMessage *message, siz
                 req->rapid_commit = false;
 
                 if (static_lease) {
-                        if (static_lease->address != address)
+                        log_dhcp_server(server, "static lease");
+
+                        if (static_lease->address != address) {
+                                log_dhcp_server(server, "address mismatch 0x%x != 0x%x", be32toh(static_lease->address), be32toh(address));
+
                                 /* The client requested an address which is different from the static lease. Refusing. */
                                 return server_send_nak_or_ignore(server, init_reboot, req);
+                        }
 
-                        if (existing_lease != hashmap_get(server->bound_leases_by_address, UINT32_TO_PTR(address)))
-                                /* The requested address is already assigned to another host. Refusing. */
-                                return server_send_nak_or_ignore(server, init_reboot, req);
+                        existing_lease_for_address = hashmap_get(server->bound_leases_by_address, UINT32_TO_PTR(address));
+                        if (existing_lease_for_client_id != existing_lease_for_address) {
+                                /* We're about to ACK the request. If we have a conflicting lease for a different
+                                 * client ID but are supposed to ignore it, remove it. */
+                                if (ignore_existing_lease && existing_lease_for_address != NULL) {
+                                        log_dhcp_server(server, "Overriding conflicting lease for address 0x%x", be32toh(existing_lease_for_address->address));
+                                        sd_dhcp_server_lease_unref(existing_lease_for_address);
+                                } else {
+                                        /* The requested address is already assigned to another host. Refusing. */
+                                        log_dhcp_server(server, "existing_lease_for_client_id == existing_lease_for_address && (!ignore_existing_lease || existing_lease_for_address == NULL)");
+                                        return server_send_nak_or_ignore(server, init_reboot, req);
+                                }
+                        }
 
                         /* Found a static lease for the client ID. */
+                        log_dhcp_server(server, "ACK request");
                         return server_ack_request(server, req, address);
                 }
 
@@ -1197,13 +1226,13 @@ int dhcp_server_handle_message(sd_dhcp_server *server, DHCPMessage *message, siz
                 log_dhcp_server(server, "RELEASE (0x%x)",
                                 be32toh(req->message->xid));
 
-                if (!existing_lease)
+                if (!existing_lease_for_client_id)
                         return 0;
 
-                if (existing_lease->address != req->message->ciaddr)
+                if (existing_lease_for_client_id->address != req->message->ciaddr)
                         return 0;
 
-                sd_dhcp_server_lease_unref(existing_lease);
+                sd_dhcp_server_lease_unref(existing_lease_for_client_id);
 
                 server_on_lease_change(server);
 
